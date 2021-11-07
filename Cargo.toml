@@ -10,7 +10,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 eframe = "0.15.0" # Gives us egui, epi and web+native backends
-
+ddcore-rs = { version = "0.1.13" }
+rfd = "0.5.1"
 serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
