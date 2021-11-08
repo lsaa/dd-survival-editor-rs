@@ -65,7 +65,7 @@ impl SpawnsetData {
             spawns_header: SpawnsHeader::default(),
             spawns: self.spawns,
             settings: Some(Settings {
-                initial_hand: self.initial_hand as u8,
+                initial_hand: self.initial_hand as u8 + 1,
                 additional_gems,
                 timer_start: Some(timer_start)
             })
