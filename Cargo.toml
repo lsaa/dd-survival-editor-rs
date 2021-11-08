@@ -9,10 +9,22 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-eframe = "0.15.0" # Gives us egui, epi and web+native backends
+eframe = { version = "0.15.0" }
 ddcore-rs = { version = "0.1.13" }
 rfd = "0.5.1"
 serde = { version = "1", features = ["derive"], optional = true }
+futures = "0.3"
+wasm-bindgen-futures = "0.4.28"
+wasm-bindgen = "0.2.78"
+js-sys = "0.3.55"
+anyhow = "1.0.45"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+  "console",
+]
+
 
 [features]
 default = []

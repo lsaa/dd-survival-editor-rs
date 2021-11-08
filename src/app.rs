@@ -1,6 +1,9 @@
-use std::fs::File;
+use std::{fs::File, sync::{Arc, mpsc::{Receiver, Sender}}};
 use std::io::Read;
-use eframe::{egui::{self, Align2, Color32, Painter, Pos2, Rect, Response, Stroke, Ui, Vec2, Widget, widgets}, epi};
+use anyhow::{Result, bail};
+use eframe::{egui::{self, Align2, Color32, Painter, Pos2, Rect, Response, Stroke, Ui, Vec2, Widget, mutex::RwLock, widgets}, epi};
+use js_sys::{Array, Uint8Array};
+use wasm_bindgen::prelude::*;
 
 #[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "persistence", serde(default))]
@@ -8,41 +11,97 @@ pub struct TemplateApp {
     #[cfg_attr(feature = "persistence", serde(skip))]
     selected_enemy: V3Enemies,
     #[cfg_attr(feature = "persistence", serde(skip))]
-    hand_level: HandLevel,
-    #[cfg_attr(feature = "persistence", serde(skip))]
-    additional_gems: String,
-    #[cfg_attr(feature = "persistence", serde(skip))]
-    disable_collection: bool,
-    #[cfg_attr(feature = "persistence", serde(skip))]
-    timer_start: String,
-    #[cfg_attr(feature = "persistence", serde(skip))]
     selected_brush: ArenaBrush,
     #[cfg_attr(feature = "persistence", serde(skip))]
     selected_tiles: [bool; 51*51],
     #[cfg_attr(feature = "persistence", serde(skip))]
-    tile_heights: [f32; 51*51],
-    #[cfg_attr(feature = "persistence", serde(skip))]
     load_spawnset: Option<Spawnset<V3Enemies>>,
+    #[cfg_attr(feature = "persistence", serde(skip))]
+    file_load: (Sender<Vec<u8>>, Receiver<Vec<u8>>),
+    #[cfg_attr(feature = "persistence", serde(skip))]
+    spawnset: SpawnsetData
+}
+
+
+#[wasm_bindgen]
+extern "C" {
+    fn save_file(s: &str, data: Uint8Array);
+}
+
+#[derive(Clone)]
+pub struct SpawnsetData {
+    arena: [f32; 51*51],
+    initial_hand: HandLevel,
+    additional_gems: String,
+    disable_collection: bool,
+    timer_start: String,
+    shrink_start: String,
+    shrink_end: String,
+    shrink_rate: String,
+    brightness: String,
+    spawns: Vec<Spawn<V3Enemies>>,
+}
+
+impl SpawnsetData {
+    pub fn try_convert_spawnset(self) -> Result<Spawnset<V3Enemies>> {
+        let additional_gems: i32 = self.additional_gems.parse()?;
+        let timer_start: f32 = self.timer_start.parse()?;
+        let shrink_start: f32 = self.shrink_start.parse()?;
+        let shrink_rate: f32 = self.shrink_rate.parse()?;
+        let shrink_end: f32 = self.shrink_end.parse()?;
+        let brightness: f32 = self.brightness.parse()?;
+
+        let mut s = Spawnset::<V3Enemies> {
+            header: Header {
+                shrink_rate,
+                shrink_start_radius: shrink_start,
+                shrink_end_radius: shrink_end,
+                brightness,
+                ..Default::default()
+            },
+            arena: Arena {
+                data: self.arena
+            },
+            spawns_header: SpawnsHeader::default(),
+            spawns: self.spawns,
+            settings: Some(Settings {
+                initial_hand: self.initial_hand as u8,
+                additional_gems,
+                timer_start: Some(timer_start)
+            })
+        };
+
+        s.recalculate_spawn_count();
+        Ok(s)
+    }
 }
 
 impl Default for TemplateApp {
     fn default() -> Self {
         Self {
             selected_enemy: V3Enemies::Empty,
-            hand_level: HandLevel::Level1,
-            additional_gems: "0".into(),
-            disable_collection: false,
-            timer_start: "0.0".into(),
             selected_brush: ArenaBrush::Select,
             selected_tiles: [false; 51*51],
-            tile_heights: [-1000.;51*51],
-            load_spawnset: None
+            load_spawnset: None,
+            file_load: std::sync::mpsc::channel(),
+            spawnset: SpawnsetData {
+                additional_gems: "0".into(),
+                initial_hand: HandLevel::Level1,
+                arena: [-1000.; 51*51],
+                disable_collection: false,
+                timer_start: "0.0".into(),
+                shrink_start: "50.0".into(),
+                shrink_end: "30.0".into(),
+                shrink_rate: "0.2".into(),
+                brightness: "100.0".into(),
+                spawns: vec![],
+            }
         }
     }
 }
 
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 enum HandLevel {
     Level1,
     Level2,
@@ -57,7 +116,7 @@ pub enum ArenaBrush {
     Deselect
 }
 
-use ddcore_rs::models::spawnset::{Arena, Spawnset, V3Enemies};
+use ddcore_rs::models::spawnset::{Arena, Header, Settings, Spawn, SpawnsHeader, Spawnset, V3Enemies};
 use crate::widgets::{V3EnemySelector, selectable_brush};
 
 impl epi::App for TemplateApp {
@@ -87,32 +146,64 @@ impl epi::App for TemplateApp {
     }
 
     fn update(&mut self, ctx: &egui::CtxRef, frame: &mut epi::Frame<'_>) {
-        let Self { 
+        let Self {
             selected_enemy, 
-            hand_level, 
-            additional_gems, 
-            disable_collection, 
-            timer_start, 
             selected_brush,
             selected_tiles,
-            tile_heights,
-            load_spawnset
+            load_spawnset,
+            file_load,
+            spawnset
         } = self;
+
+
+        if let Ok(load_data) = file_load.1.try_recv() {
+            *load_spawnset = Some(Spawnset::<V3Enemies>::deserialize(&mut &load_data[..]).unwrap());
+            let s = load_spawnset.as_ref().unwrap();
+            spawnset.arena = s.arena.data.clone();
+            spawnset.shrink_start = format!("{}", s.header.shrink_start_radius);
+            spawnset.shrink_end = format!("{}", s.header.shrink_end_radius);
+            spawnset.shrink_rate = format!("{}", s.header.shrink_rate);
+            spawnset.brightness = format!("{}", s.header.brightness);
+            spawnset.spawns = s.spawns.clone();
+            if let Some(settings) = &s.settings {
+                spawnset.initial_hand = match settings.initial_hand {
+                    2 => HandLevel::Level2,
+                    3 => HandLevel::Level3,
+                    4 => HandLevel::Level4,
+                    _ => HandLevel::Level1,
+                };
+
+                spawnset.additional_gems = format!("{}", settings.additional_gems);
+                if let Some(timer) = &settings.timer_start {
+                    spawnset.timer_start = format!("{}", timer);
+                }
+            }
+        }
         
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 egui::menu::menu(ui, "File", |ui| {
                     if ui.button("New").clicked() {
-
                     }
 
                     if ui.button("Open").clicked() {
-                        //*load_spawnset = Some(Spawnset::<V3Enemies>::deserialize(&mut f).unwrap());
-                        //*tile_heights = load_spawnset.as_ref().unwrap().arena.data.clone();
+                        let sender_clone = file_load.0.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let s = rfd::AsyncFileDialog::new().pick_file().await.unwrap();
+                            let _ = sender_clone.send(s.read().await);
+                        });
                     }
 
                     if ui.button("Save (Download)").clicked() {
-
+                        if let Ok(spawnset_file) = spawnset.clone().try_convert_spawnset() {
+                            let mut r = Vec::new();
+                            spawnset_file.serialize(&mut r);
+                            let mut a = Uint8Array::new_with_length(r.len() as u32);
+                            for (i, b) in r.iter().enumerate() {
+                                a.set_index(i as u32, *b);
+                            }
+                            unsafe { save_file("survival", a) };
+                        }
                     }
 
                     if ui.button("Replace Survival File").clicked() {
@@ -131,20 +222,20 @@ impl epi::App for TemplateApp {
         egui::Window::new("Arena Settings").resizable(true).show(ctx, |ui| {
             egui::Grid::new("arena_settings").num_columns(2).show(ui, |ui| {
                 ui.label("Shrink Start");
-                ui.text_edit_singleline(&mut String::from("0.1"));
+                ui.text_edit_singleline(&mut spawnset.shrink_start);
                 ui.end_row();
 
                 ui.label("Shrink End");
-                ui.text_edit_singleline(&mut String::from("0.1"));
+                ui.text_edit_singleline(&mut spawnset.shrink_end);
                 ui.end_row();
 
 
                 ui.label("Shrink Rate");
-                ui.text_edit_singleline(&mut String::from("0.1"));
+                ui.text_edit_singleline(&mut spawnset.shrink_rate);
                 ui.end_row();
 
                 ui.label("Brightness");
-                ui.text_edit_singleline(&mut String::from("0.1"));
+                ui.text_edit_singleline(&mut spawnset.brightness);
                 ui.end_row();
             });
 
@@ -156,25 +247,25 @@ impl epi::App for TemplateApp {
         egui::Window::new("Settings").resizable(true).show(ctx, |ui| {
             ui.label("Hand Level");
             egui::ComboBox::from_id_source("hand_level")
-                .selected_text(format!("{:?}", hand_level))
+                .selected_text(format!("{:?}", spawnset.initial_hand))
                 .width(ui.available_width() - 8.)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(hand_level, HandLevel::Level1, "Level 1");
-                    ui.selectable_value(hand_level, HandLevel::Level2, "Level 2");
-                    ui.selectable_value(hand_level, HandLevel::Level3, "Level 3");
-                    ui.selectable_value(hand_level, HandLevel::Level4, "Level 4");
+                    ui.selectable_value(&mut spawnset.initial_hand, HandLevel::Level1, "Level 1");
+                    ui.selectable_value(&mut spawnset.initial_hand, HandLevel::Level2, "Level 2");
+                    ui.selectable_value(&mut spawnset.initial_hand, HandLevel::Level3, "Level 3");
+                    ui.selectable_value(&mut spawnset.initial_hand, HandLevel::Level4, "Level 4");
             });
 
             ui.separator();
 
             ui.label("Additional Gems");
-            ui.text_edit_singleline(additional_gems);
-            ui.checkbox(disable_collection, "Disable Collection");
+            ui.text_edit_singleline(&mut spawnset.additional_gems);
+            ui.checkbox(&mut spawnset.disable_collection, "Disable Collection");
 
             ui.separator();
 
             ui.label("Timer Start");
-            ui.text_edit_singleline(timer_start);
+            ui.text_edit_singleline(&mut spawnset.timer_start);
         });
 
     
@@ -199,7 +290,7 @@ impl epi::App for TemplateApp {
 
                 for y in 0..51 {
                     for x in 0..51 {
-                        painter.rect(tile_rect(arena, x, y).expand(0.6), 0.0, tile_color(tile_heights[y as usize * 51 + x as usize]), Stroke::none());
+                        painter.rect(tile_rect(arena, x, y).expand(0.6), 0.0, tile_color(spawnset.arena[y as usize * 51 + x as usize]), Stroke::none());
                     }
                 }
 
@@ -215,7 +306,7 @@ impl epi::App for TemplateApp {
                                     ArenaBrush::Select => 0.0,
                                     ArenaBrush::Deselect => 0.0,
                                 };
-                                tile_heights[y as usize * 51 + x as usize] = h;
+                                spawnset.arena[y as usize * 51 + x as usize] = h;
                         }
                     }
                 }
@@ -314,6 +405,15 @@ fn mouse_to_arena_tile(arena: Rect, mouse: Pos2) -> Option<(u8, u8)> {
     ))
 }
 
+/*
+float colorValue = Math.Max(0, (height - TileMin) * 12 + 64);
+
+if (height < TileDefault)
+    return Color.FromRgb((byte)(colorValue * (1 + Math.Abs(height * 0.5f))), (byte)(colorValue / 4), (byte)((height - TileMin) * 8));
+
+return Color.FromRgb((byte)colorValue, (byte)(colorValue / 2), (byte)((height - TileMin) * 4));
+*/
+
 fn tile_color(height: f32) -> Color32 {
     if height < -1.1 {
         return Color32::BLACK;
@@ -323,11 +423,29 @@ fn tile_color(height: f32) -> Color32 {
         return Color32::from_rgb(0, 160, 255);
     }
 
-    let color = (height - 1. * 12. + 64.).max(0.);
-    if height < 1. {
+    let color = ((height - 1.1) * 12. + 64.).max(0.);
+    if height < 0. {
         return Color32::from_rgb( (color * (1. + (height * 0.5).abs())) as u8, (color / 4.) as u8, ((height - (-1.1)) * 8.) as u8);
     }
 
-    Color32::from_rgb(color as u8, color as u8 / 2, ((height - (-1.1)) * 4.) as u8 )
+    let r = ovrflw(color as i32);
+    let g = ovrflw((color / 2.) as i32);
+    let b = ovrflw(((height - (-1.1)) * 4.) as i32);
+
+    Color32::from_rgb(r, g, b)
 }
 
+fn ovrflw(n: i32) -> u8 {
+    let mut r = 0u8;
+    let mut remainder = n + 1;
+    while remainder > 0 {
+        if remainder > u8::MAX as i32 {
+            r = r.overflowing_add(u8::MAX).0;
+            remainder -= u8::MAX as i32;
+        } else {
+            r = r.overflowing_add(remainder as u8).0;
+            remainder -= remainder;
+        }
+    }
+    r
+}

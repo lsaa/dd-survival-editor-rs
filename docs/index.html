@@ -76,6 +76,19 @@
         // We'll defer our execution until the wasm is ready to go.
         // Here we tell bindgen the path to the wasm file so it can start
         // initialization and return to us a promise when it's done.
+
+
+		function save_file (name, data) {
+			var a = document.createElement("a");
+			document.body.appendChild(a);
+			a.style = "display: none";
+			var url = window.URL.createObjectURL(new Blob([data]));
+			a.href = url;
+			a.download = name;
+			a.click();
+			window.URL.revokeObjectURL(url);
+		}
+
 		wasm_bindgen("./dd_survival_editor_rs_bg.wasm")
             .then(on_wasm_loaded)["catch"](console.error);
 
